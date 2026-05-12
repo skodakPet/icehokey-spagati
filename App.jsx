@@ -1,11 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from "react";
-import { createClient } from "@supabase/supabase-js";
-
-// ─── SUPABASE CONFIG ─────────────────────────────────────────────────────────
-// Tyto hodnoty najdeš v Supabase → Project Settings → API
-const SUPABASE_URL = "VLOŽ_SVŮJ_SUPABASE_URL";
-const SUPABASE_ANON_KEY = "VLOŽ_SVŮJ_SUPABASE_ANON_KEY";
-const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+import { api } from "./src/api.js";
 
 // ─── BODOVÁNÍ ────────────────────────────────────────────────────────────────
 function calcPts(tip, result) {
@@ -179,18 +173,14 @@ export default function App() {
   const loadAll = useCallback(async () => {
     setLoading(true);
     try {
-      const [{ data: sett }, { data: seas }] = await Promise.all([
-        supabase.from("app_settings").select("*").single(),
-        supabase.from("seasons").select("*").order("year", { ascending: false }),
-      ]);
-      setSettings(sett);
-      setSeasons(seas || []);
-
-      const activeId = sett?.active_season_id || seas?.[0]?.id;
-      if (activeId) {
-        setActiveSeason(seas?.find(s => s.id === activeId) || seas?.[0]);
-        await loadSeason(activeId);
-      }
+      const data = await api.getState();
+      setSettings(data.settings);
+      setSeasons(data.seasons || []);
+      setActiveSeason(data.activeSeason || null);
+      setMembers(data.members || []);
+      setMatches(data.matches || []);
+      setTips(data.tips || []);
+      setMe(prev => prev || data.members?.[0]?.name || null);
     } catch (e) {
       notify("Chyba načítání: " + e.message, "warn");
     }
@@ -198,34 +188,37 @@ export default function App() {
   }, []);
 
   const loadSeason = async (seasonId) => {
-    const [{ data: mems }, { data: matchList }, { data: tipList }] = await Promise.all([
-      supabase.from("members").select("*").eq("season_id", seasonId).order("id"),
-      supabase.from("matches").select("*").eq("season_id", seasonId).order("match_date"),
-      supabase.from("tips").select("*").in("match_id",
-        (await supabase.from("matches").select("id").eq("season_id", seasonId)).data?.map(m => m.id) || []
-      ),
-    ]);
-    setMembers(mems || []);
-    setMatches(matchList || []);
-    setTips(tipList || []);
-    setMe(mems?.[0]?.name || null);
+    try {
+      const data = await api.getState(seasonId);
+      setActiveSeason(data.activeSeason || null);
+      setMembers(data.members || []);
+      setMatches(data.matches || []);
+      setTips(data.tips || []);
+      setMe(prev => prev || data.members?.[0]?.name || null);
+    } catch (e) {
+      notify("Chyba načítání: " + e.message, "warn");
+    }
   };
 
   useEffect(() => { loadAll(); }, [loadAll]);
 
-  // ── Real-time subscriptions ──
+  // ── Polling místo realtime (Neon nemá websockety) ──
   useEffect(() => {
     if (!activeSeason) return;
-    const ch = supabase.channel("realtime-tips")
-      .on("postgres_changes", { event: "*", schema: "public", table: "tips" }, () => {
-        if (activeSeason) loadSeason(activeSeason.id);
-      })
-      .on("postgres_changes", { event: "*", schema: "public", table: "matches" }, () => {
-        if (activeSeason) loadSeason(activeSeason.id);
-      })
-      .subscribe();
-    return () => supabase.removeChannel(ch);
-  }, [activeSeason]);
+    let cancelled = false;
+    const refresh = async () => {
+      if (document.hidden || cancelled) return;
+      try {
+        const data = await api.getState(activeSeason.id);
+        if (cancelled) return;
+        setMembers(data.members || []);
+        setMatches(data.matches || []);
+        setTips(data.tips || []);
+      } catch (e) { /* ticho — uživatel může být offline */ }
+    };
+    const id = setInterval(refresh, 5000);
+    return () => { cancelled = true; clearInterval(id); };
+  }, [activeSeason?.id]);
 
   // ── Live API ──
   const fetchLive = useCallback(async () => {
@@ -288,42 +281,43 @@ export default function App() {
   const addMatch = async () => {
     const opp = customOpp ? newMatch.custom.trim() : newMatch.opponent;
     if (!opp || !newMatch.date) { notify("Vyplň soupeře a datum!", "warn"); return; }
-    const { error } = await supabase.from("matches").insert({ season_id: activeSeason.id, opponent: opp, match_date: newMatch.date, match_time: newMatch.time, phase: newMatch.phase });
-    if (error) { notify("Chyba: " + error.message, "warn"); return; }
+    try {
+      await api.addMatch({ season_id: activeSeason.id, opponent: opp, match_date: newMatch.date, match_time: newMatch.time, phase: newMatch.phase });
+    } catch (e) { notify("Chyba: " + e.message, "warn"); return; }
     await loadSeason(activeSeason.id);
     setNewMatch({ opponent: "", custom: "", date: "", time: "16:20", phase: "Skupina" }); setShowAddMatch(false); notify("✅ Zápas přidán");
   };
 
   const deleteMatch = async (id) => {
-    await supabase.from("matches").delete().eq("id", id);
+    try { await api.deleteMatch(id); } catch (e) { notify("Chyba: " + e.message, "warn"); return; }
     await loadSeason(activeSeason.id); notify("Zápas smazán");
   };
 
   const setResult = async (matchId) => {
     const ri = resultInput[matchId];
     if (ri?.home === "" || ri?.away === "" || ri?.home == null) { notify("Zadej oba góly!", "warn"); return; }
-    const { error } = await supabase.from("matches").update({ status: "finished", result_home: parseInt(ri.home), result_away: parseInt(ri.away) }).eq("id", matchId);
-    if (error) { notify("Chyba: " + error.message, "warn"); return; }
+    try {
+      await api.finishMatch(matchId, parseInt(ri.home), parseInt(ri.away));
+    } catch (e) { notify("Chyba: " + e.message, "warn"); return; }
     await loadSeason(activeSeason.id); setEditingResult(null); notify("✅ Výsledek uložen");
   };
 
   const reopenMatch = async (id) => {
-    await supabase.from("matches").update({ status: "upcoming", result_home: null, result_away: null }).eq("id", id);
+    try { await api.reopenMatch(id); } catch (e) { notify("Chyba: " + e.message, "warn"); return; }
     await loadSeason(activeSeason.id); notify("Zápas znovu otevřen");
   };
 
   const saveTip = async (matchId, memberName, home, away) => {
     if (home === "" || away === "" || home == null || away == null) return;
-    // Check uniqueness (client-side pre-check, DB also enforces)
     const existing = tips.find(t => t.match_id === matchId && t.home_score === parseInt(home) && t.away_score === parseInt(away) && t.member_name !== memberName);
     if (existing) { notify(`⚠ Tip ${home}:${away} už má ${existing.member_name}! Vyber jiný.`, "warn"); return; }
-    const { error } = await supabase.from("tips").upsert({ match_id: matchId, member_name: memberName, home_score: parseInt(home), away_score: parseInt(away), updated_at: new Date().toISOString() }, { onConflict: "match_id,member_name" });
-    if (error) {
-      if (error.code === "23505") notify("⚠ Tento výsledek už někdo tipoval! Vyber jiný.", "warn");
-      else notify("Chyba uložení: " + error.message, "warn");
+    try {
+      await api.upsertTip({ match_id: matchId, member_name: memberName, home_score: parseInt(home), away_score: parseInt(away) });
+    } catch (e) {
+      if (e.code === "23505") notify("⚠ Tento výsledek už někdo tipoval! Vyber jiný.", "warn");
+      else notify("Chyba uložení: " + e.message, "warn");
       return;
     }
-    // Optimistic update
     setTips(prev => {
       const without = prev.filter(t => !(t.match_id === matchId && t.member_name === memberName));
       return [...without, { match_id: matchId, member_name: memberName, home_score: parseInt(home), away_score: parseInt(away) }];
@@ -333,13 +327,12 @@ export default function App() {
   const addMember = async () => {
     const name = newMemberName.trim();
     if (!name || members.find(m => m.name === name)) { notify("Jméno prázdné nebo existuje!", "warn"); return; }
-    const { error } = await supabase.from("members").insert({ season_id: activeSeason.id, name });
-    if (error) { notify("Chyba: " + error.message, "warn"); return; }
+    try { await api.addMember(activeSeason.id, name); } catch (e) { notify("Chyba: " + e.message, "warn"); return; }
     await loadSeason(activeSeason.id); setNewMemberName(""); setShowAddMember(false); notify(`✅ ${name} přidán/a`);
   };
 
   const removeMember = async (id, name) => {
-    await supabase.from("members").delete().eq("id", id);
+    try { await api.deleteMember(id); } catch (e) { notify("Chyba: " + e.message, "warn"); return; }
     await loadSeason(activeSeason.id);
     if (me === name) setMe(members.filter(m => m.name !== name)[0]?.name || null);
     notify(`${name} odebrán/a`);
@@ -347,12 +340,10 @@ export default function App() {
 
   const uploadPhoto = async (memberId, memberName, file) => {
     if (!file) return;
-    const ext = file.name.split(".").pop();
-    const path = `avatars/${memberId}-${Date.now()}.${ext}`;
-    const { error: upErr } = await supabase.storage.from("photos").upload(path, file, { upsert: true });
-    if (upErr) { notify("Chyba nahrávání: " + upErr.message, "warn"); return; }
-    const { data: { publicUrl } } = supabase.storage.from("photos").getPublicUrl(path);
-    await supabase.from("members").update({ photo_url: publicUrl }).eq("id", memberId);
+    try {
+      const { url } = await api.uploadPhoto(file);
+      await api.setMemberPhoto(memberId, url);
+    } catch (e) { notify("Chyba nahrávání: " + e.message, "warn"); return; }
     await loadSeason(activeSeason.id); notify("📸 Fotka uložena!");
   };
 
@@ -360,21 +351,18 @@ export default function App() {
     const y = parseInt(newSeasonYear);
     if (!y || y < 2000 || y > 2200) { notify("Zadej platný rok!", "warn"); return; }
     if (seasons.find(s => s.year === y)) { notify("Ročník existuje!", "warn"); return; }
-    const { data: newSeason, error } = await supabase.from("seasons").insert({ year: y, name: `MS Hokej ${y}` }).select().single();
-    if (error) { notify("Chyba: " + error.message, "warn"); return; }
-    // Copy members from current season
-    if (members.length > 0) {
-      await supabase.from("members").insert(members.map(m => ({ season_id: newSeason.id, name: m.name })));
-    }
-    await supabase.from("app_settings").update({ active_season_id: newSeason.id }).eq("id", 1);
+    try {
+      await api.addSeason(y, activeSeason?.id);
+    } catch (e) { notify("Chyba: " + e.message, "warn"); return; }
     await loadAll(); setNewSeasonYear(""); setShowAddSeason(false); notify(`✅ Ročník ${y} vytvořen`);
   };
 
   const switchSeason = async (seasonId) => {
-    const s = seasons.find(s => s.id === parseInt(seasonId));
+    const id = parseInt(seasonId);
+    const s = seasons.find(s => s.id === id);
     setActiveSeason(s);
-    await supabase.from("app_settings").update({ active_season_id: parseInt(seasonId) }).eq("id", 1);
-    await loadSeason(parseInt(seasonId));
+    try { await api.setActiveSeason(id); } catch (e) { notify("Chyba: " + e.message, "warn"); }
+    await loadSeason(id);
     setTab("zapasy");
   };
 
@@ -384,13 +372,15 @@ export default function App() {
     if (settingsForm.wa) upd.wa_group_name = settingsForm.wa;
     if (settingsForm.pwd) upd.admin_password = settingsForm.pwd;
     if (settingsForm.api !== undefined) upd.api_key = settingsForm.api;
-    await supabase.from("app_settings").update(upd).eq("id", 1);
+    try { await api.updateSettings(upd); } catch (e) { notify("Chyba: " + e.message, "warn"); return; }
     await loadAll(); setShowSettings(false); notify("✅ Nastavení uloženo");
   };
 
   const saveResultFromAPI = async (matchId) => {
     if (!liveData || liveData.homeScore == null) return;
-    await supabase.from("matches").update({ status: "finished", result_home: liveData.homeScore, result_away: liveData.awayScore }).eq("id", matchId);
+    try {
+      await api.finishMatch(matchId, liveData.homeScore, liveData.awayScore);
+    } catch (e) { notify("Chyba: " + e.message, "warn"); return; }
     await loadSeason(activeSeason.id); notify("✅ Výsledek z API uložen!");
   };
 
@@ -414,22 +404,6 @@ export default function App() {
     <div style={{ minHeight: "100vh", background: C.bg, display: "flex", alignItems: "center", justifyContent: "center", flexDirection: "column", gap: 16 }}>
       <div style={{ fontSize: 40 }}>🍺</div>
       <div style={{ color: C.accent, fontFamily: "system-ui", fontSize: 16 }}>Načítám tipovačku…</div>
-    </div>
-  );
-
-  // Config check
-  if (SUPABASE_URL === "VLOŽ_SVŮJ_SUPABASE_URL") return (
-    <div style={{ minHeight: "100vh", background: C.bg, display: "flex", alignItems: "center", justifyContent: "center", padding: 24 }}>
-      <div style={{ ...card, maxWidth: 400, textAlign: "center" }}>
-        <div style={{ fontSize: 40, marginBottom: 12 }}>⚠️</div>
-        <div style={{ fontSize: 16, fontWeight: 700, color: C.gold, marginBottom: 8 }}>Chybí konfigurace Supabase</div>
-        <div style={{ fontSize: 13, color: C.muted, lineHeight: 1.6 }}>
-          V souboru <code style={{ color: C.accent }}>App.jsx</code> nahraď:<br/><br/>
-          <code style={{ color: "#34D399", fontSize: 11 }}>VLOŽ_SVŮJ_SUPABASE_URL</code><br/>
-          <code style={{ color: "#34D399", fontSize: 11 }}>VLOŽ_SVŮJ_SUPABASE_ANON_KEY</code><br/><br/>
-          hodnotami z Supabase → Project Settings → API
-        </div>
-      </div>
     </div>
   );
 
@@ -562,7 +536,7 @@ export default function App() {
               <input ref={photoRef} type="file" accept="image/*" style={{ display: "none" }} onChange={e => uploadPhoto(showMemberEdit.id, showMemberEdit.name, e.target.files[0])} />
               <button onClick={() => photoRef.current?.click()} style={{ ...btn, background: "#1E3A5F", color: "#93C5FD", width: "100%" }}>📸 Nahrát fotku</button>
               {showMemberEdit.photo_url && (
-                <button onClick={async () => { await supabase.from("members").update({ photo_url: null }).eq("id", showMemberEdit.id); await loadSeason(activeSeason.id); notify("Fotka odstraněna"); }} style={{ ...btn, background: "#3F1010", color: C.danger, width: "100%" }}>🗑 Odebrat</button>
+                <button onClick={async () => { try { await api.setMemberPhoto(showMemberEdit.id, null); } catch (e) { notify("Chyba: " + e.message, "warn"); return; } await loadSeason(activeSeason.id); notify("Fotka odstraněna"); }} style={{ ...btn, background: "#3F1010", color: C.danger, width: "100%" }}>🗑 Odebrat</button>
               )}
               <button onClick={() => setShowMemberEdit(null)} style={smBtn}>Zavřít</button>
             </div>
