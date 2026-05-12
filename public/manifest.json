@@ -1,0 +1,9 @@
+{
+  "short_name": "Tipovačka",
+  "name": "Tipovačka o Plzničku",
+  "icons": [{ "src": "favicon.ico", "sizes": "64x64", "type": "image/x-icon" }],
+  "start_url": ".",
+  "display": "standalone",
+  "theme_color": "#080D16",
+  "background_color": "#080D16"
+}
